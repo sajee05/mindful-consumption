@@ -37,6 +37,7 @@ conn = init_db()
 # --- GLOBALS ---
 active_sessions = {}
 is_prompting = False
+prompt_start_time = 0 # Watchdog failsafe
 grace_period_apps = {} 
 app_reference = None 
 
@@ -212,12 +213,13 @@ class MindfulServer(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"status": "allowed"}).encode())
                 return
 
-            global is_prompting
+            global is_prompting, prompt_start_time
             if is_prompting:
                 self.wfile.write(json.dumps({"status": "prompting"}).encode())
                 return
 
             is_prompting = True
+            prompt_start_time = time.time()
             _, _, _, hwnd = get_foreground_info() 
 
             rect = RECT()
@@ -243,10 +245,16 @@ def start_local_server():
     server.serve_forever()
 
 def monitor_loop():
-    global is_prompting
+    global is_prompting, prompt_start_time
     while True:
         time.sleep(0.5) 
-        if is_prompting: continue
+        
+        # Failsafe Watchdog: If a prompt crashes and is stuck for 5 minutes, reset it.
+        if is_prompting:
+            if time.time() - prompt_start_time > 300:
+                is_prompting = False
+            continue
+            
         title, exe_name, pid, hwnd = get_foreground_info()
         if not title and not exe_name: continue
 
@@ -268,7 +276,15 @@ def monitor_loop():
         if matched_item:
             current_time = time.time()
             if matched_item in grace_period_apps and current_time < grace_period_apps[matched_item]: continue
+            
             session = active_sessions.get(matched_item)
+            
+            # CORE FIX 1: If the user closed the app completely (from Tray or Task Manager),
+            # the PID will be different. Delete the old session to force a fresh prompt!
+            if session and is_app:
+                if session.get("pid") != pid:
+                    del active_sessions[matched_item]
+                    session = None
             
             if session and current_time < session["end_time"]:
                 with DB_LOCK:
@@ -276,20 +292,20 @@ def monitor_loop():
                     conn.commit()
             else:
                 is_prompting = True
+                prompt_start_time = time.time()
                 is_time_up = session and current_time >= session["end_time"]
                 
-                # Fetch Window Coordinates BEFORE freezing to prevent deadlocks!
+                # Fetch Window Coordinates
                 rect = RECT()
                 ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
                 rect_tuple = (rect.left, rect.top, rect.right, rect.bottom)
                 
-                # Now it is safe to suspend the app
+                # CORE FIX 2: Safely freeze the app, but DO NOT hide it with ShowWindow(0).
                 if is_app:
                     try: psutil.Process(pid).suspend() 
                     except: pass
 
                 if not is_time_up:
-                    ctypes.windll.user32.ShowWindow(hwnd, 0) 
                     app_reference.after(0, lambda: show_prompt(matched_item, is_app, pid, hwnd, rect_tuple))
                 else:
                     app_reference.after(0, lambda: show_time_up_prompt(matched_item, is_app, pid, hwnd, rect_tuple))
@@ -350,7 +366,7 @@ def show_reminder_prompt(cat, rect_tuple):
         global is_prompting
         val = slider.get()
         allowed_secs = 999999 * 60 if val >= 120 else 30 if val < 1.0 else int(val) * 60
-        active_sessions["youtube_focus"] = {"end_time": time.time() + allowed_secs, "log_id": -1}
+        active_sessions["youtube_focus"] = {"end_time": time.time() + allowed_secs, "log_id": -1, "pid": None}
         win.destroy()
         is_prompting = False
 
@@ -377,15 +393,15 @@ def show_time_up_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=F
     display_name = "YouTube Video" if item_name == "youtube_focus" else item_name.title()
     ctk.CTkLabel(win, text=f"Your allowed time for {display_name} has elapsed.\nPlease close it and refocus.", font=("Segoe UI", 15)).pack(pady=5)
     
-    def acknowledge():
+    def kill_app():
         global is_prompting
+        # CORE FIX 3: Automatically kill the app if they select Close!
         if is_app:
-            try: psutil.Process(pid).resume()
+            try: psutil.Process(pid).kill()
             except: pass
-        if not is_extension:
-            ctypes.windll.user32.ShowWindow(hwnd, 9)
+        else:
+            ctypes.windll.user32.ShowWindow(hwnd, 6) # Minimize browser
             
-        grace_period_apps[item_name] = time.time() + 15 
         if item_name in active_sessions:
             del active_sessions[item_name]
             
@@ -395,15 +411,15 @@ def show_time_up_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=F
     def more_time():
         win.destroy()
         if item_name in active_sessions:
-            del active_sessions[item_name] # Clear old session
+            del active_sessions[item_name]
         show_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension)
 
     btn_frame = ctk.CTkFrame(win, fg_color="transparent")
     btn_frame.pack(pady=20)
-    ctk.CTkButton(btn_frame, text="I Will Close It", command=acknowledge, fg_color="#dc3545", hover_color="#c82333", width=150, font=("Segoe UI", 14, "bold")).pack(side="left", padx=10)
+    ctk.CTkButton(btn_frame, text="Close App", command=kill_app, fg_color="#dc3545", hover_color="#c82333", width=150, font=("Segoe UI", 14, "bold")).pack(side="left", padx=10)
     ctk.CTkButton(btn_frame, text="I Need More Time", command=more_time, fg_color="#007aff", hover_color="#0056b3", width=150, font=("Segoe UI", 14, "bold")).pack(side="right", padx=10)
-    win.protocol("WM_DELETE_WINDOW", acknowledge)
-
+    
+    win.protocol("WM_DELETE_WINDOW", kill_app)
 
 def show_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=False):
     global is_prompting
@@ -421,7 +437,7 @@ def show_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=False):
             if is_app:
                 try: psutil.Process(pid).kill()
                 except: pass
-            else: ctypes.windll.user32.ShowWindow(hwnd, 9)
+            else: ctypes.windll.user32.ShowWindow(hwnd, 6)
         prompt_win.destroy()
         is_prompting = False
     prompt_win.protocol("WM_DELETE_WINDOW", cancel)
@@ -475,14 +491,14 @@ def show_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=False):
                 c = conn.cursor()
                 c.execute("INSERT INTO usage_logs (item_name, timestamp, reason, requested_mins, actual_seconds) VALUES (?, ?, ?, ?, ?)", (item_name, datetime.now().isoformat(), reason, db_mins, 0))
                 active_key = "youtube_focus" if is_extension else item_name
-                active_sessions[active_key] = {"end_time": time.time() + allowed_secs, "log_id": c.lastrowid}
+                # Save the PID so we know if the user restarts the app!
+                active_sessions[active_key] = {"end_time": time.time() + allowed_secs, "log_id": c.lastrowid, "pid": pid}
                 conn.commit()
             
             if not is_extension:
                 if is_app:
                     try: psutil.Process(pid).resume()
                     except: pass
-                ctypes.windll.user32.ShowWindow(hwnd, 9) 
                 
             prompt_win.destroy()
             is_prompting = False
@@ -490,7 +506,7 @@ def show_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=False):
         btn_frame = ctk.CTkFrame(prompt_win, fg_color="transparent")
         btn_frame.pack(pady=20)
         ctk.CTkButton(btn_frame, text="Unlock App", command=submit, corner_radius=8, fg_color="#28a745", hover_color="#218838", font=("Segoe UI", 15, "bold"), width=150, height=40).pack(side='left', padx=10)
-        ctk.CTkButton(btn_frame, text="Cancel", command=cancel, corner_radius=8, fg_color="#dc3545", hover_color="#c82333", font=("Segoe UI", 15, "bold"), width=150, height=40).pack(side='right', padx=10)
+        ctk.CTkButton(btn_frame, text="Close App", command=cancel, corner_radius=8, fg_color="#dc3545", hover_color="#c82333", font=("Segoe UI", 15, "bold"), width=150, height=40).pack(side='right', padx=10)
         prompt_win.bind('<Return>', submit)
 
     phase_inhale()
