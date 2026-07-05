@@ -170,6 +170,7 @@ class MindfulServer(BaseHTTPRequestHandler):
 
             current_time = time.time()
             session = active_sessions.get("youtube_focus")
+            
             if session and current_time < session["end_time"]:
                 self.wfile.write(json.dumps({"status": "allowed"}).encode())
                 return
@@ -179,14 +180,18 @@ class MindfulServer(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"status": "prompting"}).encode())
                 return
 
-            # Trigger Native Python Prompt
             is_prompting = True
             _, _, _, hwnd = get_foreground_info() 
 
-            if b_edu:
-                app_reference.after(0, lambda: show_prompt("Non-Educational Video", False, None, hwnd, is_extension=True))
+            is_time_up = session and current_time >= session["end_time"]
+
+            if is_time_up:
+                app_reference.after(0, lambda: show_time_up_prompt("youtube_focus", False, None, hwnd, is_extension=True))
             else:
-                app_reference.after(0, lambda: show_reminder_prompt(cat, hwnd))
+                if b_edu:
+                    app_reference.after(0, lambda: show_prompt("youtube_focus", False, None, hwnd, is_extension=True))
+                else:
+                    app_reference.after(0, lambda: show_reminder_prompt(cat, hwnd))
 
             self.wfile.write(json.dumps({"status": "prompting"}).encode())
             
@@ -265,15 +270,19 @@ def monitor_loop():
                     conn.commit()
             else:
                 is_prompting = True
-                ctypes.windll.user32.ShowWindow(hwnd, 0) 
+                is_time_up = session and current_time >= session["end_time"]
+                
                 if is_app:
-                    try: psutil.Process(pid).suspend()
+                    try: psutil.Process(pid).suspend() # ALWAYS suspend/freeze the app
                     except: pass
 
-                if session and current_time >= session["end_time"]:
-                    app_reference.after(0, lambda: show_time_up_prompt(matched_item, is_app, pid, hwnd))
-                else:
+                if not is_time_up:
+                    # Fresh open: Hide the window to mimic "preventing it from opening"
+                    ctypes.windll.user32.ShowWindow(hwnd, 0) 
                     app_reference.after(0, lambda: show_prompt(matched_item, is_app, pid, hwnd))
+                else:
+                    # Time is up: DO NOT hide the window. Leave it frozen on the screen.
+                    app_reference.after(0, lambda: show_time_up_prompt(matched_item, is_app, pid, hwnd))
 
 def notification_loop():
     mins_passed = 0
@@ -304,7 +313,6 @@ def center_on_target_window(win, width, height, target_hwnd):
 
 # --- POPUPS ---
 def show_reminder_prompt(cat, hwnd):
-    """The new Reminder Popup for YouTube Focus Mode"""
     global is_prompting
     win = ctk.CTkToplevel(app_reference)
     win.title("Mindful Reminder")
@@ -317,10 +325,8 @@ def show_reminder_prompt(cat, hwnd):
 
     ctk.CTkLabel(win, text="⚠️ Stay Focused", font=("Segoe UI", 24, "bold"), text_color="#ffcc00").pack(pady=(25,5))
     ctk.CTkLabel(win, text=f"Video Category: {cat}", font=("Segoe UI", 15, "bold")).pack()
-    
     lbl = ctk.CTkLabel(win, text=f'"{quote}"', font=("Segoe UI", 14, "italic"), wraplength=450)
     lbl.pack(pady=15)
-
     slider_val_label = ctk.CTkLabel(win, text="Remind me again in 5 Minutes", font=("Segoe UI", 16, "bold"), text_color="#007aff")
     slider_val_label.pack(pady=(5, 5))
 
@@ -337,7 +343,7 @@ def show_reminder_prompt(cat, hwnd):
         global is_prompting
         val = slider.get()
         allowed_secs = 999999 * 60 if val >= 120 else 30 if val < 1.0 else int(val) * 60
-        active_sessions["youtube_focus"] = {"end_time": time.time() + allowed_secs, "log_id": -1} # -1 skips db logging for reminders
+        active_sessions["youtube_focus"] = {"end_time": time.time() + allowed_secs, "log_id": -1}
         win.destroy()
         is_prompting = False
 
@@ -350,24 +356,46 @@ def show_reminder_prompt(cat, hwnd):
     ctk.CTkButton(win, text="Got it, Resume Video", command=submit, fg_color="#28a745", hover_color="#218838", font=("Segoe UI", 16, "bold"), width=200, height=40).pack(pady=20)
     win.bind('<Return>', submit)
 
-def show_time_up_prompt(item_name, is_app, pid, hwnd):
+def show_time_up_prompt(item_name, is_app, pid, hwnd, is_extension=False):
     global is_prompting
     win = ctk.CTkToplevel(app_reference)
     win.title("Time Elapsed")
     win.attributes('-topmost', True)
-    center_on_target_window(win, 450, 200, hwnd)
-    ctk.CTkLabel(win, text="⚠️ Time is Up!", font=("Segoe UI", 22, "bold"), text_color="#dc3545").pack(pady=(30,10))
-    ctk.CTkLabel(win, text=f"Your allowed time for {item_name.title()} has elapsed.\nPlease close it and focus.", font=("Segoe UI", 14)).pack()
+    center_on_target_window(win, 480, 230, hwnd)
+    win.configure(fg_color=("gray95", "gray10"))
+    
+    ctk.CTkLabel(win, text="⚠️ Time is Up!", font=("Segoe UI", 22, "bold"), text_color="#dc3545").pack(pady=(20,10))
+    
+    display_name = "YouTube Video" if item_name == "youtube_focus" else item_name.title()
+    ctk.CTkLabel(win, text=f"Your allowed time for {display_name} has elapsed.\nPlease close it and focus.", font=("Segoe UI", 15)).pack(pady=5)
+    
     def acknowledge():
         global is_prompting
         if is_app:
             try: psutil.Process(pid).resume()
             except: pass
-        ctypes.windll.user32.ShowWindow(hwnd, 9)
+        if not is_extension:
+            ctypes.windll.user32.ShowWindow(hwnd, 9)
+            
         grace_period_apps[item_name] = time.time() + 15 
+        
+        # THE RESET FIX: Clear the session so next time it acts like a fresh start!
+        if item_name in active_sessions:
+            del active_sessions[item_name]
+            
         win.destroy()
         is_prompting = False
-    ctk.CTkButton(win, text="I Will Close It Now", command=acknowledge, fg_color="#dc3545", hover_color="#c82333").pack(pady=20)
+        
+    def more_time():
+        win.destroy()
+        # Launch the purpose prompt immediately
+        show_prompt(item_name, is_app, pid, hwnd, is_extension)
+
+    btn_frame = ctk.CTkFrame(win, fg_color="transparent")
+    btn_frame.pack(pady=20)
+    ctk.CTkButton(btn_frame, text="I Will Close It", command=acknowledge, fg_color="#dc3545", hover_color="#c82333", width=150, font=("Segoe UI", 14, "bold")).pack(side="left", padx=10)
+    ctk.CTkButton(btn_frame, text="I Want More Time", command=more_time, fg_color="#007aff", hover_color="#0056b3", width=150, font=("Segoe UI", 14, "bold")).pack(side="right", padx=10)
+    
     win.protocol("WM_DELETE_WINDOW", acknowledge)
 
 def show_prompt(item_name, is_app, pid, hwnd, is_extension=False):
@@ -411,7 +439,9 @@ def show_prompt(item_name, is_app, pid, hwnd, is_extension=False):
     def build_ui():
         if not prompt_win.winfo_exists(): return
         breath_label.destroy()
-        ctk.CTkLabel(prompt_win, text=f"Why are you opening {item_name.title()}?", font=("Segoe UI", 20, "bold")).pack(pady=(30, 10))
+        
+        display_name = "YouTube Video" if item_name == "youtube_focus" else item_name.title()
+        ctk.CTkLabel(prompt_win, text=f"Why are you opening {display_name}?", font=("Segoe UI", 20, "bold")).pack(pady=(30, 10))
         reason_entry = ctk.CTkEntry(prompt_win, width=420, height=45, font=("Segoe UI", 15), corner_radius=10, placeholder_text="Type your exact purpose...")
         reason_entry.pack(pady=10)
         reason_entry.focus_force()
@@ -437,8 +467,7 @@ def show_prompt(item_name, is_app, pid, hwnd, is_extension=False):
             with DB_LOCK:
                 c = conn.cursor()
                 c.execute("INSERT INTO usage_logs (item_name, timestamp, reason, requested_mins, actual_seconds) VALUES (?, ?, ?, ?, ?)", (item_name, datetime.now().isoformat(), reason, db_mins, 0))
-                active_key = "youtube_focus" if is_extension else item_name
-                active_sessions[active_key] = {"end_time": time.time() + allowed_secs, "log_id": c.lastrowid}
+                active_sessions[item_name] = {"end_time": time.time() + allowed_secs, "log_id": c.lastrowid}
                 conn.commit()
             
             if not is_extension:
@@ -533,7 +562,6 @@ class MindfulnessApp(ctk.CTk):
         self.b_sho = ctk.StringVar(value=conf.get('block_shorts', '0'))
         self.b_ree = ctk.StringVar(value=conf.get('block_reels', '1'))
 
-        # RADIO BUTTON LOGIC (Mutually Exclusive)
         def toggle_block():
             if self.b_edu.get() == "1": self.r_edu.set("0")
             self.save_settings()
