@@ -1,9 +1,6 @@
 # Mindful Consumption ☕
 
-**brewed by [sxjeel](https://sxjeel.vercel.app/)**
-
-A zero-distraction, ultra-lightweight Windows firewall for your brain. It forces you to pause, breathe, and state your exact purpose before opening distracting apps or watching non-educational YouTube videos.
-
+It forces you to pause, breathe, and state your exact purpose before opening distracting apps or watching non-educational YouTube videos.
 No fluff. No RAM hogging. Just pure accountability.
 
 ## 🔥 Features
