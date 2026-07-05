@@ -4,7 +4,7 @@ It forces you to pause, breathe, and state your exact purpose before opening dis
 No fluff. No RAM hogging. Just pure accountability.
 
 ## HOW TO INSTALL in 1-Click:
-1. Download **[`Setup.bat`](https://raw.githubusercontent.com/sajee05/mindful-consumption/main/Setup.bat)** 
+1. Download **[`Setup.bat`](https://github.com/sajee05/mindful-consumption/blob/main/mindful.py)** 
 2. Double-click `Setup.bat`.
 3. Thats it.
 
