@@ -5,7 +5,7 @@ No fluff. No RAM hogging. Just pure accountability.
 
 ## HOW TO INSTALL in 1-Click:
 1. Download **[`Setup.bat`](https://github.com/sajee05/mindful-consumption/blob/main/setup.bat)** 
-2. Double-click `Setup.bat`.
+2. Double-click `Setup.bat` from downloads.
 3. Thats it.
 
   - It will automatically download the latest version, install it to your user directory, add it to your Startup folder, and run it silently in the tray.
