@@ -99,10 +99,10 @@ USERSCRIPT_JS = """// ==UserScript==
                 } else if (data.status === "allowed") {
                     if (wasPrompting) {
                         wasPrompting = false;
-                        player.play(); // Auto-resume when python prompt finishes
+                        player.play(); 
                     }
                 }
-            }).catch(e => console.log("Mindful app not connected."));
+            }).catch(e => {});
     }
 
     function loadConfig() {
@@ -117,10 +117,47 @@ USERSCRIPT_JS = """// ==UserScript==
     loadConfig();
     setInterval(loadConfig, 5000); 
     if (window.location.host.includes("youtube.com")) {
-        setInterval(checkVideo, 1000); // Poll Python App every second
+        setInterval(checkVideo, 1000); 
     }
 })();
 """
+
+# --- WINDOWS API ---
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+def get_foreground_info():
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+    title = buf.value.lower()
+    
+    pid = ctypes.c_ulong()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    try: exe_name = psutil.Process(pid.value).name().lower()
+    except: exe_name = ""
+    return title, exe_name, pid.value, hwnd
+
+def get_open_windows():
+    windows = []
+    def enum_cb(hwnd, _):
+        if ctypes.windll.user32.IsWindowVisible(hwnd):
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value
+                if title and title != "Program Manager":
+                    pid = ctypes.c_ulong()
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    try:
+                        exe = psutil.Process(pid.value).name()
+                        windows.append((title, exe))
+                    except: pass
+    cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)(enum_cb)
+    ctypes.windll.user32.EnumWindows(cb, 0)
+    return windows
 
 # --- LIGHTWEIGHT LOCALHOST SERVER ---
 class MindfulServer(BaseHTTPRequestHandler):
@@ -183,58 +220,27 @@ class MindfulServer(BaseHTTPRequestHandler):
             is_prompting = True
             _, _, _, hwnd = get_foreground_info() 
 
+            rect = RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            rect_tuple = (rect.left, rect.top, rect.right, rect.bottom)
+
             is_time_up = session and current_time >= session["end_time"]
 
             if is_time_up:
-                app_reference.after(0, lambda: show_time_up_prompt("youtube_focus", False, None, hwnd, is_extension=True))
+                app_reference.after(0, lambda: show_time_up_prompt("youtube_focus", False, None, hwnd, rect_tuple, is_extension=True))
             else:
                 if b_edu:
-                    app_reference.after(0, lambda: show_prompt("youtube_focus", False, None, hwnd, is_extension=True))
+                    app_reference.after(0, lambda: show_prompt("youtube_focus", False, None, hwnd, rect_tuple, is_extension=True))
                 else:
-                    app_reference.after(0, lambda: show_reminder_prompt(cat, hwnd))
+                    app_reference.after(0, lambda: show_reminder_prompt(cat, rect_tuple))
 
             self.wfile.write(json.dumps({"status": "prompting"}).encode())
-            
         else:
             self.end_headers()
 
 def start_local_server():
     server = HTTPServer(('127.0.0.1', 49321), MindfulServer)
     server.serve_forever()
-
-# --- WINDOWS API FOR EXE BLOCKING ---
-def get_foreground_info():
-    hwnd = ctypes.windll.user32.GetForegroundWindow()
-    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-    buf = ctypes.create_unicode_buffer(length + 1)
-    ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-    title = buf.value.lower()
-    
-    pid = ctypes.c_ulong()
-    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    try: exe_name = psutil.Process(pid.value).name().lower()
-    except: exe_name = ""
-    return title, exe_name, pid.value, hwnd
-
-def get_open_windows():
-    windows = []
-    def enum_cb(hwnd, _):
-        if ctypes.windll.user32.IsWindowVisible(hwnd):
-            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-            if length > 0:
-                buf = ctypes.create_unicode_buffer(length + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-                title = buf.value
-                if title and title != "Program Manager":
-                    pid = ctypes.c_ulong()
-                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                    try:
-                        exe = psutil.Process(pid.value).name()
-                        windows.append((title, exe))
-                    except: pass
-    cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)(enum_cb)
-    ctypes.windll.user32.EnumWindows(cb, 0)
-    return windows
 
 def monitor_loop():
     global is_prompting
@@ -272,17 +278,21 @@ def monitor_loop():
                 is_prompting = True
                 is_time_up = session and current_time >= session["end_time"]
                 
+                # Fetch Window Coordinates BEFORE freezing to prevent deadlocks!
+                rect = RECT()
+                ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                rect_tuple = (rect.left, rect.top, rect.right, rect.bottom)
+                
+                # Now it is safe to suspend the app
                 if is_app:
-                    try: psutil.Process(pid).suspend() # ALWAYS suspend/freeze the app
+                    try: psutil.Process(pid).suspend() 
                     except: pass
 
                 if not is_time_up:
-                    # Fresh open: Hide the window to mimic "preventing it from opening"
                     ctypes.windll.user32.ShowWindow(hwnd, 0) 
-                    app_reference.after(0, lambda: show_prompt(matched_item, is_app, pid, hwnd))
+                    app_reference.after(0, lambda: show_prompt(matched_item, is_app, pid, hwnd, rect_tuple))
                 else:
-                    # Time is up: DO NOT hide the window. Leave it frozen on the screen.
-                    app_reference.after(0, lambda: show_time_up_prompt(matched_item, is_app, pid, hwnd))
+                    app_reference.after(0, lambda: show_time_up_prompt(matched_item, is_app, pid, hwnd, rect_tuple))
 
 def notification_loop():
     mins_passed = 0
@@ -298,26 +308,23 @@ def notification_loop():
             if water == '1': notification.notify(title="💧 Time to Hydrate", message="Drink water!", timeout=10)
             if qt == '1': notification.notify(title="Mindful Reminder", message=qtext, timeout=10)
 
-class RECT(ctypes.Structure):
-    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
-def center_on_target_window(win, width, height, target_hwnd):
-    rect = RECT()
-    ctypes.windll.user32.GetWindowRect(target_hwnd, ctypes.byref(rect))
-    tw, th = rect.right - rect.left, rect.bottom - rect.top
+# --- POPUP UI WINDOWS ---
+def center_with_rect(win, width, height, rect_tuple):
+    left, top, right, bottom = rect_tuple
+    tw, th = right - left, bottom - top
     if tw <= 0 or th <= 0:
         x, y = int((win.winfo_screenwidth()/2) - (width/2)), int((win.winfo_screenheight()/2) - (height/2))
     else:
-        x, y = rect.left + (tw // 2) - (width // 2), rect.top + (th // 2) - (height // 2)
+        x, y = left + (tw // 2) - (width // 2), top + (th // 2) - (height // 2)
     win.geometry(f"{width}x{height}+{x}+{y}")
 
-# --- POPUPS ---
-def show_reminder_prompt(cat, hwnd):
+def show_reminder_prompt(cat, rect_tuple):
     global is_prompting
     win = ctk.CTkToplevel(app_reference)
     win.title("Mindful Reminder")
     win.attributes('-topmost', True)
-    center_on_target_window(win, 520, 320, hwnd)
+    center_with_rect(win, 520, 320, rect_tuple)
     win.configure(fg_color=("gray95", "gray10"))
 
     with DB_LOCK:
@@ -356,18 +363,19 @@ def show_reminder_prompt(cat, hwnd):
     ctk.CTkButton(win, text="Got it, Resume Video", command=submit, fg_color="#28a745", hover_color="#218838", font=("Segoe UI", 16, "bold"), width=200, height=40).pack(pady=20)
     win.bind('<Return>', submit)
 
-def show_time_up_prompt(item_name, is_app, pid, hwnd, is_extension=False):
+
+def show_time_up_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=False):
     global is_prompting
     win = ctk.CTkToplevel(app_reference)
     win.title("Time Elapsed")
     win.attributes('-topmost', True)
-    center_on_target_window(win, 480, 230, hwnd)
+    center_with_rect(win, 480, 230, rect_tuple)
     win.configure(fg_color=("gray95", "gray10"))
     
-    ctk.CTkLabel(win, text="⚠️ Time is Up!", font=("Segoe UI", 22, "bold"), text_color="#dc3545").pack(pady=(20,10))
+    ctk.CTkLabel(win, text="⚠️ Time is Up!", font=("Segoe UI", 24, "bold"), text_color="#dc3545").pack(pady=(20,10))
     
     display_name = "YouTube Video" if item_name == "youtube_focus" else item_name.title()
-    ctk.CTkLabel(win, text=f"Your allowed time for {display_name} has elapsed.\nPlease close it and focus.", font=("Segoe UI", 15)).pack(pady=5)
+    ctk.CTkLabel(win, text=f"Your allowed time for {display_name} has elapsed.\nPlease close it and refocus.", font=("Segoe UI", 15)).pack(pady=5)
     
     def acknowledge():
         global is_prompting
@@ -378,8 +386,6 @@ def show_time_up_prompt(item_name, is_app, pid, hwnd, is_extension=False):
             ctypes.windll.user32.ShowWindow(hwnd, 9)
             
         grace_period_apps[item_name] = time.time() + 15 
-        
-        # THE RESET FIX: Clear the session so next time it acts like a fresh start!
         if item_name in active_sessions:
             del active_sessions[item_name]
             
@@ -388,22 +394,23 @@ def show_time_up_prompt(item_name, is_app, pid, hwnd, is_extension=False):
         
     def more_time():
         win.destroy()
-        # Launch the purpose prompt immediately
-        show_prompt(item_name, is_app, pid, hwnd, is_extension)
+        if item_name in active_sessions:
+            del active_sessions[item_name] # Clear old session
+        show_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension)
 
     btn_frame = ctk.CTkFrame(win, fg_color="transparent")
     btn_frame.pack(pady=20)
     ctk.CTkButton(btn_frame, text="I Will Close It", command=acknowledge, fg_color="#dc3545", hover_color="#c82333", width=150, font=("Segoe UI", 14, "bold")).pack(side="left", padx=10)
-    ctk.CTkButton(btn_frame, text="I Want More Time", command=more_time, fg_color="#007aff", hover_color="#0056b3", width=150, font=("Segoe UI", 14, "bold")).pack(side="right", padx=10)
-    
+    ctk.CTkButton(btn_frame, text="I Need More Time", command=more_time, fg_color="#007aff", hover_color="#0056b3", width=150, font=("Segoe UI", 14, "bold")).pack(side="right", padx=10)
     win.protocol("WM_DELETE_WINDOW", acknowledge)
 
-def show_prompt(item_name, is_app, pid, hwnd, is_extension=False):
+
+def show_prompt(item_name, is_app, pid, hwnd, rect_tuple, is_extension=False):
     global is_prompting
     prompt_win = ctk.CTkToplevel(app_reference)
     prompt_win.title("Mindfulness Check")
     prompt_win.attributes('-topmost', True)
-    center_on_target_window(prompt_win, 520, 380, hwnd)
+    center_with_rect(prompt_win, 520, 380, rect_tuple)
     prompt_win.configure(fg_color=("gray95", "gray10"))
     breath_label = ctk.CTkLabel(prompt_win, text="", text_color="#007aff")
     breath_label.place(relx=0.5, rely=0.5, anchor="center")
@@ -467,7 +474,8 @@ def show_prompt(item_name, is_app, pid, hwnd, is_extension=False):
             with DB_LOCK:
                 c = conn.cursor()
                 c.execute("INSERT INTO usage_logs (item_name, timestamp, reason, requested_mins, actual_seconds) VALUES (?, ?, ?, ?, ?)", (item_name, datetime.now().isoformat(), reason, db_mins, 0))
-                active_sessions[item_name] = {"end_time": time.time() + allowed_secs, "log_id": c.lastrowid}
+                active_key = "youtube_focus" if is_extension else item_name
+                active_sessions[active_key] = {"end_time": time.time() + allowed_secs, "log_id": c.lastrowid}
                 conn.commit()
             
             if not is_extension:
